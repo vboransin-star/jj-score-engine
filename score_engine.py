@@ -3,10 +3,19 @@ import sqlite3
 import time
 import json
 import hashlib
+import uuid
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 TZ = timezone(timedelta(hours=7))
 DB = os.getenv("SCORE_DB", "/data/score.sqlite3")
+
+CHAT_ID = os.getenv("SCORE_TELEGRAM_CHAT_ID", "7881007164")
+BOT_TOKEN = os.getenv("SCORE_TELEGRAM_BOT_TOKEN", "")
+
+DAILY_HOUR = 7
+DAILY_MINUTE = 5
 
 
 def conn():
@@ -40,6 +49,11 @@ def conn():
         message_id INTEGER,
         sent INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     """)
 
     c.commit()
@@ -61,18 +75,12 @@ def add(system, symbol, direction, ep, tp1, tp2, sl, created):
 
     cur = c.execute("""
         INSERT OR IGNORE INTO signals
-        (id, system, symbol, direction, ep, tp1, tp2, sl, created)
+        (id, system, symbol, direction,
+         ep, tp1, tp2, sl, created)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        signal_id,
-        system,
-        symbol,
-        direction,
-        ep,
-        tp1,
-        tp2,
-        sl,
-        created
+        signal_id, system, symbol, direction,
+        ep, tp1, tp2, sl, created
     ))
 
     inserted = cur.rowcount
@@ -83,45 +91,50 @@ def add(system, symbol, direction, ep, tp1, tp2, sl, created):
 
 
 def setout(signal_id, status, tp1=0, tp2=0, sl=0):
+    if status not in {
+        "WIN", "LOSS", "BREAKEVEN", "PENDING"
+    }:
+        raise ValueError(status)
+
     c = conn()
 
     c.execute("""
         UPDATE signals
-        SET
-            status = ?,
+        SET status = ?,
             tp1_hit = max(tp1_hit, ?),
             tp2_hit = max(tp2_hit, ?),
             sl_hit = max(sl_hit, ?)
         WHERE id = ?
     """, (
-        status,
-        tp1,
-        tp2,
-        sl,
-        signal_id
+        status, tp1, tp2, sl, signal_id
     ))
 
     c.commit()
     c.close()
 
 
-def stats(start_ts, end_ts):
+def stats(start_ts, end_ts, system=None):
     c = conn()
 
-    rows = c.execute("""
-        SELECT *
-        FROM signals
-        WHERE created >= ?
-          AND created < ?
-    """, (start_ts, end_ts)).fetchall()
+    query = """
+        SELECT * FROM signals
+        WHERE created >= ? AND created < ?
+    """
 
+    args = [start_ts, end_ts]
+
+    if system:
+        query += " AND system = ?"
+        args.append(system)
+
+    rows = c.execute(query, args).fetchall()
     c.close()
 
     counts = {
         "WIN": 0,
         "LOSS": 0,
         "BREAKEVEN": 0,
-        "PENDING": 0
+        "PENDING": 0,
     }
 
     for row in rows:
@@ -129,7 +142,7 @@ def stats(start_ts, end_ts):
 
         if status not in counts:
             raise RuntimeError(
-                "Unknown signal status: %s" % status
+                "Unknown status: %s" % status
             )
 
         counts[status] += 1
@@ -140,10 +153,24 @@ def stats(start_ts, end_ts):
         "losses": counts["LOSS"],
         "breakeven": counts["BREAKEVEN"],
         "pending": counts["PENDING"],
-        "tp1": sum(row["tp1_hit"] for row in rows),
-        "tp2": sum(row["tp2_hit"] for row in rows),
-        "sl": sum(row["sl_hit"] for row in rows)
+        "tp1": sum(r["tp1_hit"] for r in rows),
+        "tp2": sum(r["tp2_hit"] for r in rows),
+        "sl": sum(r["sl_hit"] for r in rows),
     }
+
+    decided = (
+        result["wins"]
+        + result["losses"]
+        + result["breakeven"]
+    )
+
+    result["decided_win_rate"] = (
+        round(
+            100 * result["wins"] / decided,
+            2
+        )
+        if decided else None
+    )
 
     result["invariant_ok"] = (
         result["signals"]
@@ -157,65 +184,263 @@ def stats(start_ts, end_ts):
     return result
 
 
+def boot_marker():
+    c = conn()
+
+    row = c.execute("""
+        SELECT value FROM meta
+        WHERE key = 'instance_uuid'
+    """).fetchone()
+
+    if row:
+        instance_uuid = row["value"]
+    else:
+        instance_uuid = str(uuid.uuid4())
+
+        c.execute("""
+            INSERT INTO meta(key, value)
+            VALUES('instance_uuid', ?)
+        """, (instance_uuid,))
+
+    row = c.execute("""
+        SELECT value FROM meta
+        WHERE key = 'boot_count'
+    """).fetchone()
+
+    boot_count = (
+        int(row["value"]) + 1
+        if row else 1
+    )
+
+    c.execute("""
+        INSERT INTO meta(key, value)
+        VALUES('boot_count', ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
+    """, (str(boot_count),))
+
+    c.commit()
+    c.close()
+
+    return instance_uuid, boot_count
+
+
+def period(kind, now=None):
+    now = now or datetime.now(TZ)
+
+    end = now.replace(
+        hour=DAILY_HOUR,
+        minute=DAILY_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    if kind == "daily":
+        start = end - timedelta(days=1)
+
+    elif kind == "weekly":
+        start = end - timedelta(days=7)
+
+    else:
+        raise ValueError(kind)
+
+    return (
+        int(start.timestamp()),
+        int(end.timestamp()),
+        start,
+        end,
+    )
+
+
+def report_text(kind, result, start, end, test=False):
+    prefix = "🧪 TEST " if test else ""
+
+    integrity = (
+        "OK"
+        if result["invariant_ok"]
+        else "DATA_GAP"
+    )
+
+    win_rate = (
+        "N/A"
+        if result["decided_win_rate"] is None
+        else f'{result["decided_win_rate"]:.2f}%'
+    )
+
+    return (
+        f"{prefix}JJ SCORE {kind.upper()}\n"
+        f"Period: {start.isoformat()} → {end.isoformat()}\n"
+        f"Signals: {result['signals']} | "
+        f"WIN: {result['wins']} | "
+        f"LOSS: {result['losses']} | "
+        f"BE: {result['breakeven']} | "
+        f"Pending: {result['pending']}\n"
+        f"TP1: {result['tp1']} | "
+        f"TP2: {result['tp2']} | "
+        f"SL: {result['sl']}\n"
+        f"Decided Win Rate: {win_rate}\n"
+        f"Integrity: {integrity}"
+    )
+
+
+def telegram_send(text):
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "SCORE_TELEGRAM_BOT_TOKEN missing"
+        )
+
+    data = urllib.parse.urlencode({
+        "chat_id": CHAT_ID,
+        "text": text,
+    }).encode()
+
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot"
+        + BOT_TOKEN
+        + "/sendMessage",
+        data=data,
+        method="POST",
+    )
+
+    with urllib.request.urlopen(
+        request,
+        timeout=15,
+    ) as response:
+        obj = json.loads(
+            response.read().decode()
+        )
+
+    if not obj.get("ok"):
+        raise RuntimeError(
+            "Telegram ok=false"
+        )
+
+    return int(
+        obj["result"]["message_id"]
+    )
+
+
+def send_report(kind, test=False, now=None):
+    start_ts, end_ts, start, end = period(
+        kind, now
+    )
+
+    report_id = (
+        ("TEST:" if test else "")
+        + kind
+        + ":"
+        + str(end_ts)
+    )
+
+    c = conn()
+
+    row = c.execute("""
+        SELECT message_id FROM reports
+        WHERE id = ?
+    """, (report_id,)).fetchone()
+
+    c.close()
+
+    if row:
+        return {
+            "dedup": True,
+            "message_id": row["message_id"],
+        }
+
+    result = stats(
+        start_ts,
+        end_ts,
+    )
+
+    text = report_text(
+        kind,
+        result,
+        start,
+        end,
+        test,
+    )
+
+    message_id = telegram_send(text)
+
+    c = conn()
+
+    c.execute("""
+        INSERT INTO reports(
+            id, message_id, sent
+        )
+        VALUES (?, ?, ?)
+    """, (
+        report_id,
+        message_id,
+        int(time.time()),
+    ))
+
+    c.commit()
+    c.close()
+
+    return {
+        "dedup": False,
+        "message_id": message_id,
+    }
+
+
+def due(now, last_minute):
+    stamp = now.strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+    if (
+        now.hour == DAILY_HOUR
+        and now.minute == DAILY_MINUTE
+        and stamp != last_minute
+    ):
+        kind = (
+            "weekly"
+            if now.weekday() == 0
+            else "daily"
+        )
+
+        return kind, stamp
+
+    return None, last_minute
+
+
 def selftest():
     global DB
 
     real_db = DB
-    test_db = "/tmp/jj_score_engine_selftest.sqlite3"
-
-    DB = test_db
+    DB = (
+        "/tmp/"
+        "jj_score_engine_selftest.sqlite3"
+    )
 
     for suffix in ("", "-wal", "-shm"):
         try:
-            os.remove(test_db + suffix)
+            os.remove(DB + suffix)
         except FileNotFoundError:
             pass
 
     try:
-        now = int(time.time())
+        now = 1700000000
 
-        win_id, inserted1 = add(
-            "TEST",
-            "AAA",
-            "LONG",
-            1.0,
-            2.0,
-            3.0,
-            0.5,
-            now
+        win_id, a = add(
+            "TEST", "AAA", "LONG",
+            1, 2, 3, 0.5, now
         )
 
-        loss_id, inserted2 = add(
-            "TEST",
-            "BBB",
-            "SHORT",
-            3.0,
-            2.0,
-            1.0,
-            4.0,
-            now + 1
+        loss_id, b = add(
+            "TEST", "BBB", "SHORT",
+            3, 2, 1, 4, now + 1
         )
 
-        _, inserted3 = add(
-            "TEST",
-            "CCC",
-            "LONG",
-            1.0,
-            2.0,
-            3.0,
-            0.5,
-            now + 2
+        _, c = add(
+            "TEST", "CCC", "LONG",
+            1, 2, 3, 0.5, now + 2
         )
 
-        _, duplicate_inserted = add(
-            "TEST",
-            "AAA",
-            "LONG",
-            1.0,
-            2.0,
-            3.0,
-            0.5,
-            now
+        _, duplicate = add(
+            "TEST", "AAA", "LONG",
+            1, 2, 3, 0.5, now
         )
 
         setout(
@@ -223,45 +448,69 @@ def selftest():
             "WIN",
             tp1=1,
             tp2=1,
-            sl=0
         )
 
         setout(
             loss_id,
             "LOSS",
-            tp1=0,
-            tp2=0,
-            sl=1
+            sl=1,
         )
 
         result = stats(
             now - 1,
-            now + 10
+            now + 10,
         )
 
-        expected = {
-            "signals": 3,
-            "wins": 1,
-            "losses": 1,
-            "breakeven": 0,
-            "pending": 1,
-            "tp1": 1,
-            "tp2": 1,
-            "sl": 1,
-            "invariant_ok": True
-        }
+        assert (
+            a, b, c, duplicate
+        ) == (1, 1, 1, 0)
 
-        assert inserted1 == 1
-        assert inserted2 == 1
-        assert inserted3 == 1
-        assert duplicate_inserted == 0
-        assert result == expected, (result, expected)
+        assert result["signals"] == 3
+        assert result["wins"] == 1
+        assert result["losses"] == 1
+        assert result["pending"] == 1
+        assert result["tp1"] == 1
+        assert result["tp2"] == 1
+        assert result["sl"] == 1
+        assert result["invariant_ok"]
+
+        instance1, boot1 = boot_marker()
+        instance2, boot2 = boot_marker()
+
+        assert instance1 == instance2
+        assert boot2 == boot1 + 1
+
+        monday = datetime(
+            2026, 10, 5,
+            7, 5,
+            tzinfo=TZ,
+        )
+
+        kind, _ = due(
+            monday, None
+        )
+
+        assert kind == "weekly"
+
+        tuesday = datetime(
+            2026, 10, 6,
+            7, 5,
+            tzinfo=TZ,
+        )
+
+        kind, _ = due(
+            tuesday, None
+        )
+
+        assert kind == "daily"
 
         print(json.dumps({
             "SELFTEST": "PASS",
             "DEDUP": "PASS",
             "INVARIANT": "PASS",
-            "stats": result
+            "PERSISTENCE_MARKER": "PASS",
+            "SCHEDULER": "PASS",
+            "stats": result,
         }), flush=True)
 
     finally:
@@ -271,21 +520,73 @@ def selftest():
 def main():
     selftest()
 
-    c = conn()
-    c.close()
+    instance_uuid, boot_count = (
+        boot_marker()
+    )
 
     print(json.dumps({
         "BOOT": "PASS",
         "db": DB,
-        "timezone": "Asia/Bangkok"
+        "timezone": "Asia/Bangkok",
+        "instance_uuid": instance_uuid,
+        "boot_count": boot_count,
     }), flush=True)
 
+    if os.getenv(
+        "SCORE_SEND_TEST"
+    ) == "1":
+        try:
+            print(json.dumps({
+                "TELEGRAM_TEST":
+                    send_report(
+                        "daily",
+                        test=True,
+                    )
+            }), flush=True)
+
+        except Exception as exc:
+            print(json.dumps({
+                "TELEGRAM_TEST": "FAIL",
+                "error": str(exc),
+            }), flush=True)
+
+    last_minute = None
+
     while True:
+        now = datetime.now(TZ)
+
+        kind, stamp = due(
+            now,
+            last_minute,
+        )
+
+        if kind:
+            try:
+                result = send_report(
+                    kind
+                )
+
+                print(json.dumps({
+                    "REPORT": kind,
+                    "result": result,
+                }), flush=True)
+
+                last_minute = stamp
+
+            except Exception as exc:
+                print(json.dumps({
+                    "REPORT": kind,
+                    "error": str(exc),
+                }), flush=True)
+
         print(json.dumps({
-            "HEARTBEAT": datetime.now(TZ).isoformat()
+            "HEARTBEAT":
+                now.isoformat(),
+            "boot_count":
+                boot_count,
         }), flush=True)
 
-        time.sleep(60)
+        time.sleep(30)
 
 
 if __name__ == "__main__":
