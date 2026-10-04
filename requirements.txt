@@ -1,1 +1,2 @@
-# stdlib-only service; marker for Railpack Python detection
+fastapi
+uvicorn
