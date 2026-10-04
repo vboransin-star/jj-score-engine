@@ -27,8 +27,7 @@ JJ_URL = os.getenv(
 
 HB_URL = os.getenv(
     "SCORE_HB_URL",
-    "https://ccj-jj-hybrid-shadow-v1-production.up.railway.app/"
-    "v2/score-feed?limit=500"
+    "https://ccj-jj-hybrid-shadow-v1-production.up.railway.app/v2/score-feed"
 )
 
 DAILY_HOUR = 7
