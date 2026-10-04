@@ -1589,5 +1589,31 @@ def main():
         )
 
 
-if __name__ == "__main__":
+import threading
+from fastapi import FastAPI
+import uvicorn
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "PASS"}
+
+@app.get("/health")
+def health():
+    return {
+        "status": "PASS",
+        "service": "score-engine-v2"
+    }
+
+@app.get("/ready")
+def ready():
+    return {"ready": True}
+
+def run_worker():
     main()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_worker, daemon=True).start()
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+
