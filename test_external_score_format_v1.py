@@ -7,6 +7,7 @@ class ExternalScoreTests(unittest.TestCase):
                                          wins=1, losses=3, open=1, resolved=4))
         self.assertIn("25.00%", msg)
         self.assertIn("PAPER_ONLY", msg)
+        self.assertIn("OPEN: 1", msg)
 
     def test_jj_jame(self):
         msg = format_external_score(dict(system="JJ Jame", classification="RESEARCH_UNVERIFIED",
@@ -17,8 +18,9 @@ class ExternalScoreTests(unittest.TestCase):
     def test_fail_closed(self):
         base = dict(system="DRJ", classification="PAPER_ONLY_UNVERIFIED",
                     wins=1, losses=0, open=0, resolved=1)
-        for changes in ({"wins": True}, {"resolved": 2}, {"classification": "CONFIRMED"},
-                        {"open": 2}, {"losses": -1}, {"system": "JJ"}):
+        for changes in ({"wins": True}, {"resolved": 2}, {"resolved": True},
+                        {"classification": "CONFIRMED"}, {"open": 2},
+                        {"losses": -1}, {"system": "JJ"}):
             with self.subTest(changes=changes):
                 with self.assertRaises(ValueError):
                     format_external_score({**base, **changes})
