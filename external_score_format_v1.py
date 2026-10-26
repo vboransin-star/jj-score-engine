@@ -14,7 +14,8 @@ def format_external_score(snapshot):
     wins, losses, opened = (snapshot.get(k) for k in ("wins", "losses", "open"))
     if any(type(n) is not int or n < 0 for n in (wins, losses, opened)):
         raise ValueError("INVALID_SCORE_COUNTS")
-    if snapshot.get("resolved") != wins + losses:
+    resolved = snapshot.get("resolved")
+    if type(resolved) is not int or resolved != wins + losses:
         raise ValueError("INCONSISTENT_SCORE_TOTAL")
     if system == "DRJ" and opened > 1:
         raise ValueError("INVALID_DRJ_OPEN_COUNT")
